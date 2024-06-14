@@ -22,10 +22,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -38,24 +36,24 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import javax.xml.parsers.ParserConfigurationException;
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.io.IOUtils;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.owasp.benchmarkutils.helpers.Categories;
-import org.owasp.benchmarkutils.helpers.Category;
+import org.owasp.benchmarkutils.helpers.ClassLoaderResourceProvider;
 import org.owasp.benchmarkutils.helpers.Utils;
 import org.owasp.benchmarkutils.score.domain.TestSuiteName;
 import org.owasp.benchmarkutils.score.parsers.Reader;
 import org.owasp.benchmarkutils.score.report.ScatterHome;
 import org.owasp.benchmarkutils.score.report.ScatterInterpretation;
 import org.owasp.benchmarkutils.score.report.ScatterVulns;
+import org.owasp.benchmarkutils.score.report.html.CommercialAveragesPage;
 import org.owasp.benchmarkutils.score.report.html.CommercialAveragesTable;
 import org.owasp.benchmarkutils.score.report.html.MenuUpdater;
 import org.owasp.benchmarkutils.score.report.html.OverallStatsTable;
 import org.owasp.benchmarkutils.score.report.html.ToolScorecard;
-import org.owasp.benchmarkutils.score.report.html.VulnerabilityStatsTable;
+import org.owasp.benchmarkutils.score.report.html.VulnerabilityScorecardPage;
 import org.owasp.benchmarkutils.score.service.ExpectedResultsProvider;
 import org.owasp.benchmarkutils.score.service.ResultsFileCreator;
 import org.xml.sax.SAXException;
@@ -122,10 +120,6 @@ public class BenchmarkScore extends AbstractMojo {
      */
     private static Set<Tool> tools = new TreeSet<Tool>();
 
-    // These Average Category values are computed as a side effect of running
-    // generateVulnerabilityScorecards().
-    private static Map<String, CategoryResults> averageCommercialToolResults = null;
-    private static Map<String, CategoryResults> averageNonCommerciaToolResults = null;
     private static Map<String, CategoryResults> overallAveToolResults = null;
 
     public static Configuration config;
@@ -477,9 +471,12 @@ public class BenchmarkScore extends AbstractMojo {
             catSet.addAll(tool.getOverallResults().getCategories());
         }
 
-        // Then we generate each vulnerability scorecard
         CommercialAveragesTable commercialAveragesTable =
                 new CommercialAveragesTable(TESTSUITENAME, TESTSUITEVERSION);
+        generateComparisonCharts(catSet, scoreCardDir, commercialAveragesTable);
+
+        // Then we generate each vulnerability scorecard
+
         BenchmarkScore.generateVulnerabilityScorecards(
                 tools, catSet, scoreCardDir, commercialAveragesTable);
         System.out.println("Vulnerability scorecards computed.");
@@ -544,6 +541,28 @@ public class BenchmarkScore extends AbstractMojo {
         System.out.println(BenchmarkScore.TESTSUITENAME.simpleName() + " scorecards complete.");
 
         System.exit(0);
+    }
+
+    private static void generateComparisonCharts(
+            Set<String> catSet,
+            File scoreCardDir,
+            CommercialAveragesTable commercialAveragesTable) {
+        overallAveToolResults = new HashMap<>();
+
+        for (String cat : catSet) {
+            // Generate a comparison chart for all tools for this vuln category. When
+            // constructed, scatter contains the Overall, Non-commercial, and Commercial stats
+            // for this category across all tools.
+            ScatterVulns scatter =
+                    ScatterVulns.generateComparisonChart(cat, tools, config.focus, scoreCardDir);
+
+            BenchmarkScore.overallAveToolResults.put(cat, scatter.getOverallCategoryResults());
+
+            // Only build commercial stats scorecard if there are at 2+ commercial tools
+            if (scatter.getCommercialToolCount() > 1) {
+                commercialAveragesTable.add(scatter);
+            }
+        }
     }
 
     /**
@@ -700,26 +719,6 @@ public class BenchmarkScore extends AbstractMojo {
         metrics.setFindingCounts(totalTP, totalFP, totalFN, totalTN);
 
         return metrics;
-    }
-
-    /**
-     * This method translates vulnerability names, e.g., Cross-Site Scripting, to their CWE number.
-     *
-     * @param categoryName - The category to translate.
-     * @return The CWE # of that category.
-     */
-    public static int translateNameToCWE(String categoryName) {
-        int cwe;
-
-        Category category = Categories.getByName(categoryName);
-        if (category == null) {
-            System.out.println("Error: Category: " + categoryName + " not supported.");
-            cwe = -1;
-        } else {
-            cwe = category.getCWE();
-        }
-
-        return cwe;
     }
 
     /**
@@ -913,123 +912,42 @@ public class BenchmarkScore extends AbstractMojo {
 
     /**
      * Generate all the vulnerability scorecards. And then 1 commercial tool average scorecard if
-     * there are commercial tool results for at least 2 commercial tools. Also create the Tool
-     * objects for: averageCommercialToolResults, averageNonCommercialToolResults,
-     * overallAveToolResults.
+     * there are commercial tool results for at least 2 commercial tools.
      */
     private static void generateVulnerabilityScorecards(
             Set<Tool> tools,
             Set<String> catSet,
             File scoreCardDir,
             CommercialAveragesTable commercialAveragesTable) {
+        ClassLoaderResourceProvider resourceProvider =
+                new ClassLoaderResourceProvider(BenchmarkScore.class);
 
-        // A side effect of this method is to calculate these averages
-        averageCommercialToolResults = new HashMap<String, CategoryResults>();
-        averageNonCommerciaToolResults = new HashMap<String, CategoryResults>();
-        overallAveToolResults = new HashMap<String, CategoryResults>();
-
-        final ClassLoader CL = BenchmarkScore.class.getClassLoader();
-
-        VulnerabilityStatsTable vulnerabilityStatsTable =
-                new VulnerabilityStatsTable(config, TESTSUITENAME, tools);
+        VulnerabilityScorecardPage vulnerabilityScorecardPage =
+                new VulnerabilityScorecardPage(
+                        config,
+                        TESTSUITENAME,
+                        tools,
+                        TESTSUITEVERSION,
+                        resourceProvider,
+                        PROJECTLINKENTRY,
+                        PRECISIONKEYENTRY,
+                        FSCOREKEYENTRY);
 
         for (String cat : catSet) {
-            try {
-                // Generate a comparison chart for all tools for this vuln category. When
-                // constructed, scatter contains the Overall, Non-commercial, and Commercial stats
-                // for this category across all tools.
-                ScatterVulns scatter =
-                        ScatterVulns.generateComparisonChart(
-                                cat, tools, config.focus, scoreCardDir);
-
-                // Before creating html for this vuln category, save the category level results into
-                // averageCommercialToolResults, averageNonCommerciaToolResults,
-                // overallAveToolResults
-                BenchmarkScore.averageCommercialToolResults.put(
-                        cat, scatter.getCommercialCategoryResults());
-                BenchmarkScore.averageNonCommerciaToolResults.put(
-                        cat, scatter.getNonCommercialCategoryResults());
-                BenchmarkScore.overallAveToolResults.put(cat, scatter.getOverallCategoryResults());
-
-                String filename =
-                        TESTSUITENAME.simpleName()
-                                + "_v"
-                                + TESTSUITEVERSION
-                                + "_Scorecard_for_"
-                                + cat.replace(' ', '_');
-                File htmlFile = new File(scoreCardDir, filename + ".html");
-
-                // Resources in a jar file have to be loaded as streams. Not directly as Files.
-                final String VULNTEMPLATERESOURCE = "scorecard/vulntemplate.html";
-                InputStream vulnTemplateStream = CL.getResourceAsStream(VULNTEMPLATERESOURCE);
-                if (vulnTemplateStream == null) {
-                    System.out.println(
-                            "ERROR - vulnTemplate stream is null for resource: "
-                                    + VULNTEMPLATERESOURCE);
-                }
-
-                String html = IOUtils.toString(vulnTemplateStream, StandardCharsets.UTF_8);
-                html = html.replace("${testsuite}", BenchmarkScore.TESTSUITENAME.fullName());
-                String fullTitle =
-                        BenchmarkScore.TESTSUITENAME.fullName() + " Scorecard for " + cat;
-
-                html = html.replace("${image}", filename + ".png");
-                html = html.replace("${title}", fullTitle);
-                html =
-                        html.replace(
-                                "${vulnerability}",
-                                cat + " (CWE #" + BenchmarkScore.translateNameToCWE(cat) + ")");
-                html = html.replace("${version}", TESTSUITEVERSION);
-                html = html.replace("${projectlink}", BenchmarkScore.PROJECTLINKENTRY);
-
-                html = html.replace("${table}", vulnerabilityStatsTable.generateFor(cat));
-                html = html.replace("${tprlabel}", config.tprLabel);
-                html =
-                        html.replace(
-                                "${precisionkey}",
-                                BenchmarkScore.PRECISIONKEYENTRY + BenchmarkScore.FSCOREKEYENTRY);
-
-                Files.write(htmlFile.toPath(), html.getBytes());
-
-                // Only build commercial stats scorecard if there are at 2+ commercial tools
-                if (scatter.getCommercialToolCount() > 1) {
-                    commercialAveragesTable.add(scatter);
-                }
-
-            } catch (IOException e) {
-                System.out.println("Error generating vulnerability summaries: " + e.getMessage());
-                e.printStackTrace();
-            }
-        } // end for loop
+            vulnerabilityScorecardPage.writeTo(scoreCardDir, cat);
+        }
 
         if (commercialAveragesTable.hasEntries()) {
-            try {
-                Path htmlfile =
-                        Paths.get(
-                                scoreCardDir.getAbsolutePath()
-                                        + File.separator
-                                        + commercialAveragesTable.filename());
-                // Resources in a jar file have to be loaded as streams. Not directly as Files.
-                InputStream vulnTemplateStream =
-                        CL.getResourceAsStream(scoreCardDir + "/commercialAveTemplate.html");
-                String html = IOUtils.toString(vulnTemplateStream, StandardCharsets.UTF_8);
-                html = html.replace("${testsuite}", BenchmarkScore.TESTSUITENAME.fullName());
-                html = html.replace("${version}", TESTSUITEVERSION);
-                html = html.replace("${projectlink}", BenchmarkScore.PROJECTLINKENTRY);
-
-                html = html.replace("${table}", commercialAveragesTable.render());
-                html = html.replace("${tprlabel}", config.tprLabel);
-                html =
-                        html.replace(
-                                "${precisionkey}",
-                                BenchmarkScore.PRECISIONKEYENTRY + BenchmarkScore.FSCOREKEYENTRY);
-
-                Files.write(htmlfile, html.getBytes());
-                System.out.println("Commercial average scorecard computed.");
-            } catch (IOException e) {
-                System.out.println("Error generating commercial scorecard: " + e.getMessage());
-                e.printStackTrace();
-            }
-        } // end if
+            new CommercialAveragesPage(
+                            commercialAveragesTable,
+                            resourceProvider,
+                            TESTSUITEVERSION,
+                            config,
+                            TESTSUITENAME,
+                            PROJECTLINKENTRY,
+                            PRECISIONKEYENTRY,
+                            FSCOREKEYENTRY)
+                    .writeTo(scoreCardDir);
+        }
     }
 }
